@@ -5,7 +5,7 @@ const fs = require('fs')
 const path = require('path')
 const querystring = require('querystring')
 const { API_URLS, EXPLORER_URLS, RequestStatus, VerificationStatus } = require('./constants')
-const { enforce, enforceOrThrow } = require('./util')
+const { enforce, enforceOrThrow, normaliseContractPath } = require('./util')
 const { version } = require('./package.json')
 
 const logger = cliLogger({ level: 'info' })
@@ -70,7 +70,10 @@ const parseConfig = (config) => {
   const apiUrl = API_URLS[networkId]
   enforce(apiUrl, `Etherscan has no support for network ${config.network} with id ${networkId}`, logger)
 
-  const apiKey = config.api_keys && config.api_keys.etherscan
+  const etherscanApiKey = config.api_keys && config.api_keys.etherscan
+  const bscscanApiKey = config.api_keys && config.api_keys.bscscan
+
+  const apiKey = apiUrl.includes('bscscan') && bscscanApiKey ? bscscanApiKey : etherscanApiKey
   enforce(apiKey, 'No Etherscan API key specified', logger)
 
   enforce(config._.length > 1, 'No contract name(s) specified', logger)
@@ -117,7 +120,7 @@ const verifyContract = async (artifact, options) => {
 const sendVerifyRequest = async (artifact, options) => {
   const compilerVersion = extractCompilerVersion(artifact)
   const encodedConstructorArgs = await fetchConstructorValues(artifact, options)
-  const inputJSON = await fetchInputJSON(artifact, options)
+  const inputJSON = getInputJSON(artifact, options)
 
   const postQueries = {
     apikey: options.apiKey,
@@ -126,7 +129,7 @@ const sendVerifyRequest = async (artifact, options) => {
     contractaddress: artifact.networks[`${options.networkId}`].address,
     sourceCode: JSON.stringify(inputJSON),
     codeformat: 'solidity-standard-json-input',
-    contractname: `${artifact.sourcePath}:${artifact.contractName}`,
+    contractname: `${artifact.ast.absolutePath}:${artifact.contractName}`,
     compilerversion: compilerVersion,
     constructorArguements: encodedConstructorArgs
   }
@@ -184,8 +187,10 @@ const fetchConstructorValues = async (artifact, options) => {
   }
 }
 
-const fetchInputJSON = async (artifact, options) => {
+const getInputJSON = (artifact, options) => {
   const metadata = JSON.parse(artifact.metadata)
+
+  const libraries = getLibraries(artifact, options)
 
   const inputJSON = {
     language: metadata.language,
@@ -194,17 +199,44 @@ const fetchInputJSON = async (artifact, options) => {
       remappings: metadata.settings.remappings,
       optimizer: metadata.settings.optimizer,
       evmVersion: metadata.settings.evmVersion,
-      libraries: { '': artifact.networks[`${options.networkId}`].links || {} }
+      libraries
     }
   }
 
   for (const contractPath in inputJSON.sources) {
-    const absolutePath = require.resolve(contractPath)
+    // If we're on Windows we need to de-Unixify the path so that Windows can read the file
+    const normalisedContractPath = normaliseContractPath(contractPath, logger)
+    const absolutePath = require.resolve(normalisedContractPath)
     const content = fs.readFileSync(absolutePath, 'utf8')
     inputJSON.sources[contractPath] = { content }
   }
 
   return inputJSON
+}
+
+const getLibraries = (artifact, options) => {
+  const libraries = {
+    // Example data structure of libraries object in Standard Input JSON
+    // 'ConvertLib.sol': {
+    //   'ConvertLib': '0x...',
+    //   'OtherLibInSameSourceFile': '0x...'
+    // }
+  }
+
+  const links = artifact.networks[`${options.networkId}`].links || {}
+
+  for (const libraryName in links) {
+    // Retrieve the source path for this library
+    const libraryArtifact = getArtifact(libraryName, options)
+    const librarySourceFile = libraryArtifact.ast.absolutePath
+
+    // Add the library to the object of libraries for this source path
+    const librariesForSourceFile = libraries[librarySourceFile] || {}
+    librariesForSourceFile[libraryName] = links[libraryName]
+    libraries[librarySourceFile] = librariesForSourceFile
+  }
+
+  return libraries
 }
 
 const verificationStatus = async (guid, options) => {
